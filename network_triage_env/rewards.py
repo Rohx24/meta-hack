@@ -177,8 +177,8 @@ def compute_reward(
     )
     raw_total = total_cls_raw + total_act_pos + total_penalties + efficiency_bonus
     normalized = raw_total / max_positive if max_positive > 0 else 0.0
-    # Spec requires reward in [0.0, 1.0]; penalties reduce score toward 0 but never below
-    normalized = max(0.0, min(1.0, normalized))
+    # Spec requires reward strictly in (0, 1) — exclusive of 0.0 and 1.0
+    normalized = max(0.01, min(0.99, normalized))
 
     cls_fraction = total_cls_raw / (total_alerts * CLS_MAX) if total_alerts > 0 else 0.0
     act_fraction = (total_act_pos + total_penalties) / (total_alerts * ACT_MAX) if total_alerts > 0 else 0.0
