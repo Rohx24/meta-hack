@@ -102,7 +102,9 @@ def tasks() -> dict:
 
 
 @app.post("/reset")
-def reset(req: ResetRequest) -> dict:
+def reset(req: Optional[ResetRequest] = None) -> dict:
+    if req is None:
+        req = ResetRequest()
     try:
         obs = _env.reset(
             task_id=req.task_id,
