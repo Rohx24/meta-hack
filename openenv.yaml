@@ -1,0 +1,192 @@
+name: NetworkTriage
+version: "1.0.0"
+description: >
+  Network Alert Triage Simulator — an AI agent acts as a NOC analyst,
+  classifying incoming network alerts and taking appropriate response actions
+  (block, escalate, ignore, rate-limit). Three tasks of increasing difficulty
+  test classification accuracy, context-aware incident response, and
+  efficiency under load.
+
+author: "NetworkTriage Team"
+license: MIT
+tags:
+  - openenv
+  - cybersecurity
+  - network-operations
+  - classification
+  - multi-step
+  - incident-response
+
+# ── Tasks ────────────────────────────────────────────────────
+
+tasks:
+  - id: alert-classify
+    name: "Alert Classification"
+    difficulty: easy
+    max_steps: 1
+    total_alerts: 5
+    description: >
+      Agent receives 5 simultaneous network alerts covering a range of
+      types (port scan, normal traffic, DDoS, brute force, normal).
+      Must classify each and choose the correct response action.
+    reward_range: [-1.0, 1.0]
+    evaluation_metric: weighted_accuracy
+
+  - id: incident-response
+    name: "Incident Response"
+    difficulty: medium
+    max_steps: 5
+    total_alerts: 10
+    description: >
+      Agent receives 10 network alerts in 5 sequential batches of 2.
+      Some alerts depend on context from prior batches (e.g. same IP
+      appearing repeatedly should trigger escalated response).
+      Tests both classification accuracy and context-aware decision making.
+    reward_range: [-1.0, 1.0]
+    evaluation_metric: weighted_accuracy_with_context
+
+  - id: triage-under-load
+    name: "Triage Under Load"
+    difficulty: hard
+    max_steps: 3
+    total_alerts: 20
+    description: >
+      Mass incident: 20 simultaneous alerts including red herrings,
+      ambiguous signals, and related attack chains. Agent must classify
+      all alerts, take appropriate actions, AND provide a priority order.
+      Efficiency bonus for handling critical threats first.
+      Blocking legitimate traffic carries heavy penalties.
+    reward_range: [-1.0, 1.0]
+    evaluation_metric: composite_triage_score
+
+# ── Observation Space ─────────────────────────────────────────
+
+observation_space:
+  type: structured
+  schema:
+    task_id: string
+    task_name: string
+    step: integer
+    max_steps: integer
+    done: boolean
+    instructions: string
+    alerts:
+      type: array
+      items:
+        alert_id: string
+        timestamp: string          # ISO 8601
+        source_ip: string
+        dest_ip: string
+        source_port: integer
+        dest_port: integer
+        protocol: string           # TCP / UDP / ICMP
+        bytes_transferred: integer
+        packets_count: integer
+        duration_seconds: float
+        alert_type_raw: string     # Raw IDS/IPS label
+        description: string        # Human-readable context
+        severity: string           # critical / high / medium / low / info
+        frequency: integer
+        geo_location: string       # 2-letter ISO or MULTIPLE / INTERNAL
+        threat_score: float        # 0.0 – 10.0
+        tags: array[string]
+        related_alert_ids: array[string]
+    context:
+      type: object
+      description: >
+        Accumulated session context: seen_ips, ip_to_alerts,
+        repeated_ips, alert_history, total_alerts_seen
+    previous_actions:
+      type: array
+      description: History of agent decisions from prior steps
+
+# ── Action Space ──────────────────────────────────────────────
+
+action_space:
+  type: structured
+  schema:
+    classifications:
+      type: object
+      description: "Map of alert_id → classification"
+      values:
+        - port_scan
+        - normal
+        - ddos
+        - brute_force
+        - malware
+        - data_exfiltration
+        - reconnaissance
+        - lateral_movement
+        - privilege_escalation
+        - unknown
+    actions:
+      type: object
+      description: "Map of alert_id → action"
+      values:
+        - block
+        - escalate
+        - ignore
+        - rate_limit
+        - monitor
+        - investigate
+    priority_order:
+      type: array
+      description: "Alert IDs ordered highest-to-lowest priority (required for triage-under-load)"
+      required_for: triage-under-load
+    reasoning:
+      type: string
+      description: "Optional chain-of-thought explanation"
+      required: false
+
+# ── Reward Function ───────────────────────────────────────────
+
+reward:
+  range: [-1.0, 1.0]
+  components:
+    correct_classification:
+      value: +0.2
+      description: Per alert, if classification matches ground truth (full credit)
+    partial_classification:
+      value: 0.0–0.14
+      description: Per alert, for near-correct classifications (e.g. reconnaissance vs port_scan)
+    correct_action:
+      value: +0.3
+      description: Per alert, if action matches optimal response (full credit)
+    partial_action:
+      value: 0.05–0.24
+      description: Per alert, for close actions (e.g. rate_limit instead of block)
+    wrong_block_penalty:
+      value: -0.4
+      description: Per alert, when agent blocks legitimate (non-threat) traffic
+    missed_critical_penalty:
+      value: -0.2
+      description: Per alert, when agent ignores a critical threat
+    efficiency_bonus:
+      value: 0.0–0.2
+      description: >
+        Hard task only. Awarded when critical alerts appear in the top
+        positions of priority_order. Full 0.2 when all 5 critical alerts
+        are in top-5 positions.
+  normalization: >
+    Raw score divided by theoretical maximum per task, clipped to [-1.0, 1.0].
+
+# ── Environment ───────────────────────────────────────────────
+
+environment:
+  python_version: "3.11"
+  server:
+    port: 7860
+    framework: fastapi
+    endpoints:
+      - "POST /reset  — start new episode"
+      - "POST /step   — submit action"
+      - "GET  /state  — current env state"
+      - "GET  /tasks  — list available tasks"
+      - "GET  /health — health check"
+  hardware:
+    min_vcpu: 2
+    min_ram_gb: 8
+  properties:
+    deterministic: true       # Same inputs → same outputs
+    external_calls: false     # No outbound network calls from env
+    stateful: true            # State persists across steps within an episode

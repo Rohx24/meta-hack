@@ -1,0 +1,255 @@
+"""
+NetworkTriage baseline inference script.
+
+Mandatory stdout format (per OpenEnv spec):
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+
+Environment variables:
+    API_BASE_URL  — OpenAI-compatible API base URL (default: https://api.openai.com/v1)
+    MODEL_NAME    — Model identifier (default: gpt-4o-mini)
+    HF_TOKEN      — API key (also checks OPENAI_API_KEY)
+    SERVER_URL    — Environment server URL (default: http://localhost:7860)
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from typing import Optional
+
+import httpx
+from openai import OpenAI
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
+SERVER_URL = os.getenv("SERVER_URL", "http://localhost:7860")
+BENCHMARK = "network-triage"
+
+client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+http = httpx.Client(base_url=SERVER_URL, timeout=60.0)
+
+# ── Mandatory log helpers (exact format required by spec) ─────────────────────
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    # Truncate action string to keep line readable
+    action_str = action[:120].replace("\n", " ") if action else "null"
+    print(
+        f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are an expert Network Operations Center (NOC) analyst with 10 years of experience.
+
+CLASSIFICATION OPTIONS:
+  port_scan, normal, ddos, brute_force, malware, data_exfiltration,
+  reconnaissance, lateral_movement, privilege_escalation, unknown
+
+ACTION OPTIONS:
+  block, escalate, ignore, rate_limit, monitor, investigate
+
+RULES:
+  - NEVER block legitimate/normal traffic (heavy penalty)
+  - Repeated IPs across steps warrant escalated response
+  - Red herrings exist: scheduled backups, CDN traffic look suspicious but are normal
+  - For priority_order: CRITICAL threats first, then HIGH, then lower severity
+
+Respond with ONLY valid JSON:
+{
+  "classifications": {"<alert_id>": "<type>", ...},
+  "actions":         {"<alert_id>": "<action>", ...},
+  "priority_order":  ["<alert_id>", ...],
+  "reasoning":       "<brief explanation>"
+}"""
+
+
+# ── LLM call ─────────────────────────────────────────────────────────────────
+
+def _format_alert(a: dict) -> str:
+    return (
+        f"[{a['alert_id']}] {a['alert_type_raw']}\n"
+        f"  {a['source_ip']}:{a['source_port']} -> {a['dest_ip']}:{a['dest_port']} "
+        f"({a['protocol']}) | {a['bytes_transferred']:,}B | sev={a['severity']} "
+        f"threat={a['threat_score']} geo={a.get('geo_location','?')}\n"
+        f"  tags: {', '.join(a.get('tags',[]))}\n"
+        f"  {a['description'][:200]}"
+    )
+
+
+def _build_prompt(obs_data: dict) -> str:
+    alerts = obs_data.get("alerts", [])
+    ctx = obs_data.get("context", {})
+    prev = obs_data.get("previous_actions", [])
+    step = obs_data.get("step", 0)
+    max_steps = obs_data.get("max_steps", 1)
+    task_id = obs_data.get("task_id", "")
+
+    parts = [
+        f"TASK: {obs_data.get('task_name','')} | Step {step+1}/{max_steps}",
+        obs_data.get("instructions", ""),
+        "=" * 50,
+        f"ALERTS ({len(alerts)}):",
+    ]
+    for a in alerts:
+        parts.append(_format_alert(a))
+
+    if ctx.get("repeated_ips"):
+        parts.append("CONTEXT — repeated IPs:")
+        for ip, cnt in ctx["repeated_ips"].items():
+            parts.append(f"  {ip}: seen {cnt}x")
+
+    if prev:
+        parts.append("PRIOR DECISIONS (last 6):")
+        for pa in prev[-6:]:
+            parts.append(f"  {pa['alert_id']}: {pa['classification']} -> {pa['action']}")
+
+    ids = [a["alert_id"] for a in alerts]
+    parts.append(f"Classify these IDs: {ids}")
+    if task_id == "triage-under-load":
+        parts.append("Include 'priority_order' with ALL 20 alert IDs.")
+    return "\n".join(parts)
+
+
+def _call_llm(prompt: str, retries: int = 3) -> dict:
+    for attempt in range(retries):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=2048,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            if attempt < retries - 1:
+                time.sleep(1)
+        except Exception as exc:
+            if attempt < retries - 1:
+                time.sleep(2)
+            else:
+                raise
+    return {"classifications": {}, "actions": {}, "priority_order": [], "reasoning": "parse_error"}
+
+
+# ── Task runner ───────────────────────────────────────────────────────────────
+
+def run_task(task_id: str) -> float:
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+
+    step_rewards: list[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+    error_msg: Optional[str] = None
+
+    try:
+        r = http.post("/reset", json={"task_id": task_id})
+        r.raise_for_status()
+        result = r.json()
+
+        step_num = 0
+        while not result.get("done", False):
+            obs_data = result.get("observation", result)
+            alert_ids = [a["alert_id"] for a in obs_data.get("alerts", [])]
+            if not alert_ids:
+                break
+
+            step_num += 1
+            prompt = _build_prompt(obs_data)
+            action_dict = _call_llm(prompt)
+
+            # Ensure all current alert IDs are covered
+            for aid in alert_ids:
+                action_dict.setdefault("classifications", {})[aid] = \
+                    action_dict["classifications"].get(aid, "unknown")
+                action_dict.setdefault("actions", {})[aid] = \
+                    action_dict["actions"].get(aid, "monitor")
+
+            sr = http.post("/step", json={"action": action_dict})
+            sr.raise_for_status()
+            result = sr.json()
+
+            reward = float(result.get("reward") or 0.0)
+            done = result.get("done", False)
+            step_rewards.append(reward)
+            steps_taken = step_num
+            score = reward  # final step reward is the cumulative score
+
+            # Compact action summary for [STEP] line
+            action_summary = json.dumps({
+                "cls": action_dict.get("classifications", {}),
+                "act": action_dict.get("actions", {}),
+            }, separators=(",", ":"))
+
+            log_step(step=step_num, action=action_summary, reward=reward, done=done, error=None)
+
+            if done:
+                break
+
+        success = score >= 0.5
+
+    except Exception as exc:
+        error_msg = str(exc)
+        log_step(step=steps_taken + 1, action="null", reward=0.0, done=True, error=error_msg)
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=step_rewards)
+
+    return score
+
+
+# ── Entry point — run all 3 tasks ────────────────────────────────────────────
+
+def main() -> None:
+    # Verify server is up
+    try:
+        health = http.get("/health")
+        health.raise_for_status()
+    except Exception as exc:
+        print(f"ERROR: Cannot reach server at {SERVER_URL}: {exc}", file=sys.stderr)
+        print("Start the server with: python server.py", file=sys.stderr)
+        sys.exit(1)
+
+    tasks = ["alert-classify", "incident-response", "triage-under-load"]
+    all_scores: dict[str, float] = {}
+
+    for task_id in tasks:
+        all_scores[task_id] = run_task(task_id)
+        print(flush=True)
+
+    avg = sum(all_scores.values()) / len(all_scores)
+    print(f"# Average score across all tasks: {avg:.2f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

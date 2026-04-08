@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "network-triage-env"
+version = "1.0.0"
+description = "Network Alert Triage Simulator — OpenEnv environment"
+requires-python = "==3.11.*"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "openai>=2.7.2",
+    "httpx>=0.28.0",
+    "openenv-core>=0.2.2",
+]
+
+[project.scripts]
+server = "server.app:main"
+network-triage-server = "server.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["network_triage_env*"]
+
+[tool.openenv]
+name = "NetworkTriage"
+version = "1.0.0"
+entry_point = "server:app"
