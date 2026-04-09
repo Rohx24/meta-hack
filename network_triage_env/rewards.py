@@ -39,6 +39,11 @@ MISSED_CRITICAL_PENALTY = -0.2  # Per critical threat ignored
 EFFICIENCY_BONUS_MAX = 0.2
 
 
+def _clamp_open_interval(value: float, low: float = 0.01, high: float = 0.99) -> float:
+    """Clamp score-like fields to the validator's required open interval."""
+    return max(low, min(high, value))
+
+
 def _score_classification(
     alert_id: str,
     predicted: str,
@@ -177,8 +182,7 @@ def compute_reward(
     )
     raw_total = total_cls_raw + total_act_pos + total_penalties + efficiency_bonus
     normalized = raw_total / max_positive if max_positive > 0 else 0.0
-    # Spec requires reward strictly in (0, 1) — exclusive of 0.0 and 1.0
-    normalized = max(0.01, min(0.99, normalized))
+    normalized = _clamp_open_interval(normalized)
 
     cls_fraction = total_cls_raw / (total_alerts * CLS_MAX) if total_alerts > 0 else 0.0
     act_fraction = (total_act_pos + total_penalties) / (total_alerts * ACT_MAX) if total_alerts > 0 else 0.0
@@ -191,8 +195,8 @@ def compute_reward(
 
     return Reward(
         total=round(normalized, 4),
-        classification_score=round(cls_fraction, 4),
-        action_score=round(act_fraction, 4),
+        classification_score=round(_clamp_open_interval(cls_fraction), 4),
+        action_score=round(_clamp_open_interval(act_fraction), 4),
         efficiency_bonus=round(efficiency_bonus, 4),
         penalties=round(total_penalties, 4),
         breakdown=breakdown,
